@@ -5,7 +5,6 @@ import plotly.express as px
 import plotly.graph_objects as go
 from sklearn.ensemble import RandomForestRegressor
 from datetime import datetime, timedelta, time
-from sqlalchemy import create_engine, text
 import warnings
 
 # Suppress warnings
@@ -14,7 +13,7 @@ warnings.filterwarnings('ignore')
 # -----------------------------------------------------------------------------
 # 1. CONFIGURATION & CSS INJECTION
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="Inbox", layout="wide", page_icon="")
+st.set_page_config(page_title="Inbox", layout="wide", page_icon="📊")
 
 def inject_custom_css():
     st.markdown("""
@@ -81,17 +80,8 @@ def inject_custom_css():
 inject_custom_css()
 
 # -----------------------------------------------------------------------------
-# DATABASE & HELPER FUNCTIONS
+# HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
-@st.cache_resource
-def get_db_engine():
-    try:
-        db_config = st.secrets["mysql"]
-        url = f"mysql+pymysql://{db_config['username']}:{db_config['password']}@{db_config['host']}:{db_config['port']}/{db_config['database']}"
-        return create_engine(url)
-    except Exception:
-        return None
-
 def clean_currency(x):
     if isinstance(x, str):
         clean_str = x.replace('₱', '').replace('$', '').replace(',', '').strip()
@@ -104,20 +94,20 @@ def clean_currency(x):
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=600)
 def load_and_filter_data(start_h, end_h):
-    engine = get_db_engine()
-    if not engine:
-        st.error("Database Connection Failed")
-        st.stop()
-
+    # --- FIXED: Use st.connection to automatically read secrets.toml ---
     try:
-        with engine.connect() as conn:
-            df_trans = pd.read_sql(text("SELECT * FROM transactions"), conn)
-            df_td = pd.read_sql(text("SELECT * FROM transactiondetails"), conn)
-            df_prod = pd.read_sql(text("SELECT * FROM products"), conn)
+        # "mydb" matches [connections.mydb] in your secrets file
+        conn = st.connection("mydb", type="sql")
+        
+        # Use conn.query() - simpler and automatically caches
+        df_trans = conn.query("SELECT * FROM transactions", ttl=600)
+        df_td = conn.query("SELECT * FROM transactiondetails", ttl=600)
+        df_prod = conn.query("SELECT * FROM products", ttl=600)
     except Exception as e:
-        st.error(f"SQL Error: {str(e)}")
+        st.error(f"Database Connection Error: {str(e)}")
         st.stop()
 
+    # Normalization
     df_trans.columns = df_trans.columns.str.lower()
     df_td.columns = df_td.columns.str.lower()
     df_prod.columns = df_prod.columns.str.lower()
@@ -130,29 +120,36 @@ def load_and_filter_data(start_h, end_h):
     df_trans['tdate'] = pd.to_datetime(df_trans['tdate'], errors='coerce')
     df_trans.dropna(subset=['tdate'], inplace=True)
 
+    # Clean Currency Columns
     for col in ['gross', 'cogs', 'grossprofit']:
         if col in df_trans.columns:
             if df_trans[col].dtype == 'object':
                 df_trans[col] = df_trans[col].apply(clean_currency)
             df_trans[col] = pd.to_numeric(df_trans[col], errors='coerce').fillna(0)
 
+    # Filter Voids
     if 'isvoid' in df_trans.columns:
         df_trans['isvoid'] = pd.to_numeric(df_trans['isvoid'], errors='coerce').fillna(0)
         df_trans = df_trans[df_trans['isvoid'] == 0].copy()
 
+    # Time Features
     df_trans['hour'] = df_trans['tdate'].dt.hour
     df_trans['date_only'] = df_trans['tdate'].dt.date
     
+    # Filter by Shift Hours
     if start_h <= end_h:
         df_trans = df_trans[(df_trans['hour'] >= start_h) & (df_trans['hour'] <= end_h)]
     else:
+        # Overnight shift (e.g., 10 PM to 2 AM)
         df_trans = df_trans[(df_trans['hour'] >= start_h) | (df_trans['hour'] <= end_h)]
 
+    # Clean Product IDs
     if 'productid' in df_td.columns: 
         df_td['productid'] = df_td['productid'].astype(str).str.replace(r'\.0$', '', regex=True)
     if 'productid' in df_prod.columns: 
         df_prod['productid'] = df_prod['productid'].astype(str).str.replace(r'\.0$', '', regex=True)
     
+    # Merge Data
     if 'productid' in df_td.columns and 'productid' in df_prod.columns:
         df_full = df_td.merge(df_prod, on='productid', how='left')
     else:
@@ -175,6 +172,7 @@ def load_and_filter_data(start_h, end_h):
             df_full['sellingprice'] = df_full['sellingprice'].apply(clean_currency)
         df_full['sellingprice'] = pd.to_numeric(df_full['sellingprice'], errors='coerce').fillna(0)
 
+    # Standardize Product Name
     potential_names = ['description_x', 'description', 'productname', 'name', 'item_name', 'product_name']
     found_col = None
     for cand in potential_names:
@@ -200,10 +198,12 @@ def train_model(df_trans):
     daily_sales = df_trans.groupby('date_only')['gross'].sum().reset_index()
     daily_sales['date_only'] = pd.to_datetime(daily_sales['date_only'])
 
-    if not daily_sales.empty:
-        full_idx = pd.date_range(start=daily_sales['date_only'].min(), end=daily_sales['date_only'].max(), freq='D')
-        daily_sales = daily_sales.set_index('date_only').reindex(full_idx, fill_value=0).reset_index()
-        daily_sales.rename(columns={'index': 'date_only'}, inplace=True)
+    if daily_sales.empty:
+        return None, pd.DataFrame()
+
+    full_idx = pd.date_range(start=daily_sales['date_only'].min(), end=daily_sales['date_only'].max(), freq='D')
+    daily_sales = daily_sales.set_index('date_only').reindex(full_idx, fill_value=0).reset_index()
+    daily_sales.rename(columns={'index': 'date_only'}, inplace=True)
 
     daily_sales['day_of_week'] = daily_sales['date_only'].dt.dayofweek
     daily_sales['is_weekend'] = daily_sales['day_of_week'].apply(lambda x: 1 if x >= 5 else 0)
@@ -226,11 +226,19 @@ def get_prediction(model, recent_data, target_date):
     if model is None or recent_data.empty: return 0.0
     target_dt = pd.to_datetime(target_date)
     last_row = recent_data.iloc[-1]
-    features = pd.DataFrame([[target_dt.dayofweek, 1 if target_dt.dayofweek>=5 else 0, target_dt.month, 
-                              last_row['gross'], 
-                              recent_data.iloc[-7]['gross'] if len(recent_data)>=7 else last_row['gross'], 
-                              recent_data['gross'].tail(7).mean()]], 
-                            columns=['day_of_week', 'is_weekend', 'month', 'lag_1', 'lag_7', 'rolling_mean_7'])
+    
+    # Safely get lag values
+    lag_7_val = recent_data.iloc[-7]['gross'] if len(recent_data) >= 7 else last_row['gross']
+    
+    features = pd.DataFrame([[
+        target_dt.dayofweek, 
+        1 if target_dt.dayofweek >= 5 else 0, 
+        target_dt.month, 
+        last_row['gross'], 
+        lag_7_val, 
+        recent_data['gross'].tail(7).mean()
+    ]], columns=['day_of_week', 'is_weekend', 'month', 'lag_1', 'lag_7', 'rolling_mean_7'])
+    
     return max(0, model.predict(features)[0])
 
 def get_weekly_stock_recommendations(df_full, start_date):
@@ -260,7 +268,7 @@ def get_weekly_stock_recommendations(df_full, start_date):
 
         final_weekly_demand = int(np.ceil(weekly_demand))
         
-        # Velocity Ranking Logic (Renamed from Risk)
+        # Velocity Ranking Logic
         velocity_score = 0
         if row['velocity'] > 10: velocity_score += 40
         elif row['velocity'] > 5: velocity_score += 30
@@ -367,6 +375,8 @@ def main():
         st.stop()
 
     # --- CALCULATIONS ---
+    # Ensure date types match for comparison
+    df_trans['date_only'] = pd.to_datetime(df_trans['date_only']).dt.date
     actual_day_data = df_trans[df_trans['date_only'] == target_date]
     has_actual_data = not actual_day_data.empty
 
@@ -383,17 +393,23 @@ def main():
         rev_delta_text, rev_delta_color = "AI Forecast", "delta-neu"
 
     monthly_forecast = 0
-    if model is not None:
-        m_start = target_date.replace(day=1)
+    if model is not None and not df_trans.empty:
+        # Convert target_date to datetime if it's date
+        target_dt = pd.to_datetime(target_date)
+        m_start = target_dt.replace(day=1)
         m_end = (m_start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-        month_mask = (df_trans['date_only'] >= m_start) & (df_trans['date_only'] <= m_end)
+        
+        # Ensure comparison works
+        month_mask = (pd.to_datetime(df_trans['date_only']) >= m_start) & (pd.to_datetime(df_trans['date_only']) <= m_end)
         actuals = df_trans.loc[month_mask, 'gross'].sum()
-        dates_present = set(df_trans.loc[month_mask, 'date_only'])
+        
+        dates_present = set(pd.to_datetime(df_trans.loc[month_mask, 'date_only']))
         
         future_sum = 0
         curr = m_start
         while curr <= m_end:
-            if curr not in dates_present: future_sum += get_prediction(model, recent_data, curr)
+            if curr not in dates_present: 
+                future_sum += get_prediction(model, recent_data, curr)
             curr += timedelta(days=1)
         monthly_forecast = actuals + future_sum
     
